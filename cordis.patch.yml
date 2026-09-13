@@ -1,0 +1,37 @@
+# dsh-multi-user bundle patch: inserts the multi-user gateway row into the
+# profile's plugin roster.
+#
+# The row starts one HTTP gateway in front of this DSH instance. The gateway
+# owns the login page, the admin console (/mu/admin), the per-user REST API
+# (/mu/api/*) and a reverse proxy that forwards every authenticated user to
+# THEIR OWN DSH instance — a separate `dsh web` process with its own
+# $DSH_HOME, so sessions, credentials, settings and workspaces are physically
+# independent.
+#
+# Installed via `dsh plugin --profile <name> add <tgz>`; the bundle patch is
+# applied automatically (dsh.profile.bundles reconciliation) — do NOT insert
+# this row again in the profile patch (a duplicate id crashes the loader).
+#
+# Every deployment value can be overridden from the profile's own
+# cordis.patch.yml with an id-targeted row, e.g.:
+#
+#   - id: dsh-multi-user
+#     config:
+#       listenHost: '127.0.0.1'
+#       listenPort: 3090
+#       adminHomeMode: managed
+#
+# A patch replaces the targeted row's whole `config`, so restate every key.
+- insert:
+    - id: dsh-multi-user
+      name: dsh-multi-user
+      config:
+        enabled: true
+        listenHost: '0.0.0.0'
+        listenPort: 3090
+        basePath: /mu
+        adminHomeMode: host
+        sessionTtlHours: 24
+        idleTimeoutMinutes: 30
+        seedOnCreate: true
+        portBase: 31000

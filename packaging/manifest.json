@@ -1,0 +1,127 @@
+{
+  "name": "dsh-multi-user",
+  "version": "1.0.0",
+  "builtAt": "2026-09-13T06:36:17+0800",
+  "files": [
+    {
+      "path": "README.md",
+      "size": 10206,
+      "md5": "1d4744dff0d0b31027e7a8dd37f6293f"
+    },
+    {
+      "path": "install.sh",
+      "size": 14384,
+      "md5": "00573b96a2fabf8c78f1af14f0887184"
+    },
+    {
+      "path": "payload/dsh-multi-user/README.md",
+      "size": 12692,
+      "md5": "7fe2d0e7d73f56891994e1e25f244184"
+    },
+    {
+      "path": "payload/dsh-multi-user/cordis.patch.yml",
+      "size": 1368,
+      "md5": "cf31e25eeedaf6ad853c3158b32d4cc1"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/admin-ui.js",
+      "size": 35528,
+      "md5": "990643fd59d7af4a1301e1ecb16b85d2"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/admin.js",
+      "size": 8036,
+      "md5": "11e85e6cf3da346338c200cbe7763d0c"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/config.js",
+      "size": 14275,
+      "md5": "bd3d1d264f4dfe922ab73dc04207c5b7"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/gateway.js",
+      "size": 36883,
+      "md5": "ee6fd6da72ed2e61e8c5863358d51b4d"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/index.js",
+      "size": 11629,
+      "md5": "2ef71ce951687be51e4bd53bf4a4f5dd"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/sessions.js",
+      "size": 7010,
+      "md5": "4fb613450aa0f75807098a3adeff8b0c"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/spreadsheet.js",
+      "size": 29619,
+      "md5": "cb2b14634914a9533517f3179a4493ff"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/store.js",
+      "size": 20190,
+      "md5": "0a2840caf2d080e0d29858307ada16b3"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/supervisor.js",
+      "size": 34910,
+      "md5": "57c6b42810e5f88d4d93a141b8c8fd1b"
+    },
+    {
+      "path": "payload/dsh-multi-user/lib/tools.js",
+      "size": 9559,
+      "md5": "1d5a07ff91efbf34857584700c277f07"
+    },
+    {
+      "path": "payload/dsh-multi-user/package.json",
+      "size": 606,
+      "md5": "f16c0c3d4cb46517ec78e70de9ad48de"
+    },
+    {
+      "path": "plugin/dsh-multi-user-1.0.0.tgz",
+      "size": 68957,
+      "md5": "ee5b9378942125c92973f4d9e18996ab"
+    },
+    {
+      "path": "tools/check_nav.mjs",
+      "size": 5312,
+      "md5": "b5c17068c29022e1c75e7cd0a745ac02"
+    },
+    {
+      "path": "tools/check_password.mjs",
+      "size": 9134,
+      "md5": "37e73abf0e0016a42bdc22e7f5bc4364"
+    },
+    {
+      "path": "tools/check_profile_sync.mjs",
+      "size": 16256,
+      "md5": "d38f15aea7ce2b1a08e437bf9ffd2139"
+    },
+    {
+      "path": "tools/patch_nginx.py",
+      "size": 12578,
+      "md5": "9b1195254869a0460903ac383b089680"
+    },
+    {
+      "path": "tools/sync_apps.mjs",
+      "size": 5614,
+      "md5": "97a6ffd6016f03efae48947904cd46d0"
+    },
+    {
+      "path": "uninstall.sh",
+      "size": 6472,
+      "md5": "b8049b4ce1a844e1f02996c8d90c7817"
+    },
+    {
+      "path": "verify.mjs",
+      "size": 19807,
+      "md5": "a23ac3b591ae34c252c54f6317a39828"
+    },
+    {
+      "path": "verify.sh",
+      "size": 1642,
+      "md5": "a63512b9c5116e4b7374e5d0744b2f91"
+    }
+  ]
+}

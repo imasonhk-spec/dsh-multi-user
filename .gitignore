@@ -1,0 +1,23 @@
+# build / runtime artifacts
+node_modules/
+dist/
+coverage/
+*.tgz
+*.log
+.DS_Store
+
+# editor / OS
+*.swp
+*~
+.idea/
+.vscode/
+
+# local backups (never commit)
+*.bak
+*.bak-*
+_backup/
+
+# local secrets / runtime state
+.env
+.env.*
+*.local.yaml

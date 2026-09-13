@@ -1,0 +1,25 @@
+{
+  "name": "dsh-multi-user",
+  "version": "1.0.0",
+  "description": "DSH 多用户管理网关：登录门禁 + 用户增删查改 + 批量导入 + 每用户独立 DSH 空间（独立 DSH_HOME / 会话 / 凭据 / 工作区）。安装到任意 DSH 主机即可用。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib/",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

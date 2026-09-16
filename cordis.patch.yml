@@ -35,3 +35,12 @@
         idleTimeoutMinutes: 30
         seedOnCreate: true
         portBase: 31000
+        userProfilePatch: |-
+          - id: webserver
+            config:
+              host: '127.0.0.1'
+              port: {port}
+          - id: raganything-kb
+            config:
+              autoStart: true
+              sidecarPort: {sidecarPort}

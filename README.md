@@ -19,7 +19,7 @@
 
 ```bash
 # 1) 装进 web profile（在 DSH 安装目录执行）
-dsh plugin --profile web add /path/to/dsh-multi-user-1.0.0.tgz
+dsh plugin --profile web add /path/to/dsh-multi-user-1.0.1.tgz
 
 # 2) 给宿主 DSH 进程设置一个启动 token（adminHomeMode: host 需要）
 #    例如 systemd 单元里加一行 Environment=DSH_WEB_TOKEN=<长随机串>

@@ -23,7 +23,7 @@ set -euo pipefail
 
 HERE="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 PKG_NAME="dsh-multi-user"
-PKG_VERSION="1.0.0"
+PKG_VERSION="1.1.0"
 TGZ="$HERE/plugin/${PKG_NAME}-${PKG_VERSION}.tgz"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 LOG_PREFIX="[dsh-multi-user]"

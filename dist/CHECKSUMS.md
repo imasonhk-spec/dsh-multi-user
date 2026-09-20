@@ -1,0 +1,2 @@
+dsh-multi-user-1.1.0.tar.gz  b570999e99beb8d64abab50c902d40bf29cdb15734f00d64ffe5193ceb0c07d2
+dsh-multi-user-1.1.0.tgz      64f9441f09f7657ae0c2e96b25c3b1ed12bb9d145df546890946c608b1916d65

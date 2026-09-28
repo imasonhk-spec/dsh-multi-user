@@ -1,7 +1,7 @@
 {
   "name": "dsh-multi-user",
-  "version": "1.1.0",
-  "builtAt": "2026-09-20T08:40:29+0800",
+  "version": "1.1.1",
+  "builtAt": "2026-09-28T13:25:00+0800",
   "files": [
     {
       "path": "README.md",
@@ -11,7 +11,7 @@
     {
       "path": "install.sh",
       "size": 14384,
-      "md5": "1952715fb72f0d86b77214b04fbb29ff"
+      "md5": "504ca5185df195eccd86aefdfc271be7"
     },
     {
       "path": "payload/dsh-multi-user/README.md",
@@ -35,8 +35,8 @@
     },
     {
       "path": "payload/dsh-multi-user/lib/config.js",
-      "size": 15114,
-      "md5": "df461de61d27bf2d2332d351ab34b170"
+      "size": 15428,
+      "md5": "ae613759f4dc5b927b3cb72018d07c77"
     },
     {
       "path": "payload/dsh-multi-user/lib/gateway.js",
@@ -65,8 +65,8 @@
     },
     {
       "path": "payload/dsh-multi-user/lib/supervisor.js",
-      "size": 40750,
-      "md5": "fe17cedcafff33e230de8313f112e6fa"
+      "size": 46222,
+      "md5": "8f7936f704d11862ee113684032ed222"
     },
     {
       "path": "payload/dsh-multi-user/lib/tools.js",
@@ -76,12 +76,12 @@
     {
       "path": "payload/dsh-multi-user/package.json",
       "size": 606,
-      "md5": "8f4065c6e88868540ef1a0ad03f3dcaf"
+      "md5": "6388cbfc35e726657825bbfe5f361c44"
     },
     {
-      "path": "plugin/dsh-multi-user-1.1.0.tgz",
-      "size": 87324,
-      "md5": "11997e7d2b9f9040f1553003b5bc7bda"
+      "path": "plugin/dsh-multi-user-1.1.1.tgz",
+      "size": 88682,
+      "md5": "1f74a899f5994bb85f408a937fced9e2"
     },
     {
       "path": "tools/check_nav.mjs",

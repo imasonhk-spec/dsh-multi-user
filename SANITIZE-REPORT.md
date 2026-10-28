@@ -1,4 +1,4 @@
-# 脱敏报告 · dsh-multi-user 1.1.3
+# 脱敏报告 · dsh-multi-user 1.1.4
 
 - 来源: `/home/lgsj/.dsh/profiles/web/node_modules/dsh-multi-user`（8.6 线上活副本）
 - 文件数: 14

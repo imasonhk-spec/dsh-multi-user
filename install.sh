@@ -426,6 +426,148 @@ if [ -d "$PAYLOAD/services/env" ]; then
 fi
 
 # =============================================================================
+step "5b. JSON 配置密钥现场生成"
+# =============================================================================
+# 🔴 打包时 sanitize_json_secrets() 会把 config.json 里的 token/apiKey 等字段
+#    脱敏成字符串 "__GEN__"。但安装器早期只处理 systemd unit 与 KEY=__GEN__
+#    形式的 env 文件，JSON 里的 "__GEN__" 被原样留下 —— 后果是 raganything
+#    sidecar 拿着字面量 "__GEN__" 当 token 启动：进程活着、端口通、健康检查过，
+#    但 /shared/* 一律 401，前端表现为「知识库未连接」，且日志里没有任何报错。
+#    这里按 manifest 的 fsEntries 精确回填（不做全盘 grep，避免误伤大目录）。
+render_json_secrets(){
+  local mf="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest.json"
+  [ -f "$mf" ] || { warn "无 manifest.json，跳过"; return 0; }
+  command -v python3 >/dev/null || { warn "无 python3，跳过 JSON 密钥生成"; return 0; }
+  if [ "$DRY" = "1" ]; then ok "  [dry] would render JSON __GEN__ under $DSH_HOME"; return 0; fi
+
+  local out
+  out=$(python3 - "$mf" "$PAYLOAD" "$DSH_HOME" "$USER_HOME" <<'PYEOF'
+import json, os, re, secrets, sys
+
+mf, payload, dsh_home, user_home = sys.argv[1:5]
+try:
+    m = json.load(open(mf))
+except Exception as e:
+    print("ERR\tmanifest 解析失败: %s" % e); sys.exit(0)
+
+dsh_home = dsh_home.rstrip("/")
+user_home = user_home.rstrip("/")
+
+def map_tgt(dst):
+    """与 restore_fs_from_manifest() 的 bash 逻辑严格一致。"""
+    rel = dst[3:] if dst.startswith("fs/") else dst.lstrip("/")
+    if rel == "home/lgsj/.dsh" or rel.startswith("home/lgsj/.dsh/"):
+        return dsh_home + rel[len("home/lgsj/.dsh"):]
+    if rel == "home/lgsj" or rel.startswith("home/lgsj/"):
+        return user_home + rel[len("home/lgsj"):]
+    return "/" + rel
+
+# 只处理本次包真的带来的 .json（config.json / settings.json / *.credentials.json ...）
+targets, seen = [], set()
+for e in m.get("fsEntries", []):
+    dst = e.get("dst", "")
+    if not dst.lower().endswith(".json"):
+        continue
+    if e.get("type", "file") != "file":
+        continue
+    tgt = map_tgt(dst)
+    if tgt in seen:
+        continue
+    seen.add(tgt)
+    if os.path.isfile(tgt):
+        targets.append(tgt)
+
+if not targets:
+    print("NONE\t0"); sys.exit(0)
+
+# 秘钥字段名 —— 与包端 sanitize_json_secrets() 的 SECRET_KEY_RE 保持同源
+KEY_RE = re.compile(
+    r"(?i)^(token|access_token|refresh_token|api_?key|apikey|secret|client_secret|"
+    r"password|passwd|salt|private_?key|auth_?token|session_?key|jwt_?secret)$")
+# 值为 "__GEN__" 的字段一律替换；不依赖字段名（有些配置用自定义键名）
+GEN = "__GEN__"
+total = 0
+
+def walk(o, depth=0):
+    global total
+    if depth > 12:
+        return
+    if isinstance(o, dict):
+        for k, v in list(o.items()):
+            if isinstance(v, str) and v.strip() == GEN:
+                o[k] = secrets.token_hex(32)     # 64 位 hex，与原 token 形态一致
+                total += 1
+            elif isinstance(v, dict):
+                walk(v, depth + 1)
+            elif isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        walk(it, depth + 1)
+    elif isinstance(o, list):
+        for it in o:
+            walk(it, depth + 1)
+
+for path in targets:
+    try:
+        raw = open(path, encoding="utf-8").read()
+    except Exception:
+        continue
+    if GEN not in raw:
+        continue
+    try:
+        data = json.loads(raw)
+    except Exception:
+        # 非严格 JSON（带注释/尾逗号）：退化为纯文本替换
+        n = raw.count(GEN)
+        txt = re.sub(re.escape(GEN), lambda _m: secrets.token_hex(32), raw)
+        try:
+            open(path, "w", encoding="utf-8").write(txt)
+            print("OK\t%s\t%d\traw" % (path, n))
+        except Exception as e:
+            print("ERR\t%s\t%s" % (path, e))
+        continue
+    before = total
+    walk(data)
+    if total > before:
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            print("OK\t%s\t%d\tjson" % (path, total - before))
+        except Exception as e:
+            print("ERR\t%s\t%s" % (path, e))
+PYEOF
+)
+
+  local any=0
+  while IFS=$'\t' read -r st path cnt mode; do
+    [ -n "${st:-}" ] || continue
+    case "$st" in
+      OK)
+        any=1
+        # 含密钥的文件收权限，与 env 文件同规格
+        $SUDO chmod 600 "$path" 2>/dev/null || true
+        ok "  密钥已生成: ${path}（${cnt} 项，${mode}）"
+        ;;
+      ERR) warn "  ${path}: ${cnt}" ;;
+      NONE) : ;;
+    esac
+  done <<< "$out"
+  [ "$any" = "0" ] && ok "  JSON 无 __GEN__ 占位，无需处理"
+}
+
+render_json_secrets
+
+# 服务里如果引用了刚生成密钥的那个 JSON，必须重启一次才能读到新值
+if [ -n "$SERVICES" ] && [ "$DRY" = "0" ]; then
+  for s in $SERVICES; do
+    [ "$(systemctl is-active "$s" 2>/dev/null)" = "active" ] || continue
+    $SUDO systemctl restart "$s" >/dev/null 2>&1 || true
+    ok "  $s: 已重启（加载新密钥）"
+  done
+  sleep 2
+fi
+
+# =============================================================================
 step "6. 重启 DSH 使插件生效"
 # =============================================================================
 if [ "$SKIP_RESTART" = "0" ] && [ "$DRY" = "0" ]; then

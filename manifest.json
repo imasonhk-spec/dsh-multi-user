@@ -11,12 +11,25 @@
   "hasVenv": false,
   "hasNode": false,
   "hasHarness": false,
-  "generatedAt": "2026-11-01T23:00:34+08:00",
+  "generatedAt": "2026-11-02T00:19:37+08:00",
   "host": "lgsj",
   "installScope": [
     "host-profile",
     "all-existing-accounts"
   ],
   "baseRepo": "imasonhk-spec/dsh",
-  "baseTag": "v0.2.0"
+  "baseTag": "v0.2.0",
+  "fsEntries": [],
+  "aptProvides": [],
+  "runtimeFrom": [],
+  "pathRemap": [
+    {
+      "from": "/home/lgsj/.dsh",
+      "to": "@DSH_HOME@"
+    },
+    {
+      "from": "/home/lgsj",
+      "to": "@USER_HOME@"
+    }
+  ]
 }

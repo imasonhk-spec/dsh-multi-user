@@ -38,20 +38,20 @@ USERS_DIR="$DSH_HOME/multi-user/users"
 # DSH 属主（用于 chown，避免 root 装完 lgsj 读不了）
 DSH_OWNER="${DSH_OWNER:-$(stat -c '%U:%G' "$DSH_HOME" 2>/dev/null || echo "$(id -un):$(id -gn)")}"
 PAYLOAD="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/PAYLOAD"
-
 GREEN=$'\033[32m'; RED=$'\033[31m'; YEL=$'\033[33m'; CYA=$'\033[36m'; RST=$'\033[0m'
 ok(){ echo "${GREEN}  ✓${RST} $*"; }
 warn(){ echo "${YEL}  !${RST} $*"; }
 err(){ echo "${RED}  ✗${RST} $*" >&2; }
 step(){ echo; echo "${CYA}==> $*${RST}"; }
 
-WITH_BASE=0; SKIP_RESTART=0; DRY=0; FORCE=0; PORT_BASE=""
+WITH_BASE=0; SKIP_RESTART=0; DRY=0; FORCE=0; PORT_BASE=""; IGNORE_APT=0
 for a in "$@"; do
   case $a in
     --with-base) WITH_BASE=1 ;;
     --skip-restart) SKIP_RESTART=1 ;;
     --dry-run) DRY=1 ;;
     --force) FORCE=1 ;;
+    --ignore-apt) IGNORE_APT=1 ;;
     --port-base=*) PORT_BASE="${a#*=}" ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
   esac
@@ -87,6 +87,53 @@ fi
 gen_secret(){ openssl rand -hex "${1:-24}" 2>/dev/null || head -c "${1:-24}" /dev/urandom | xxd -p | head -c $(( ${1:-24}*2 )); }
 
 # =============================================================================
+# 前置函数定义（必须在 step 0 之前，bash 按顺序解析）
+# =============================================================================
+# 目标用户 home：优先 SUDO_USER -> DSH_HOME 推导 -> 当前用户
+# 🔴 直接 root 跑时 SUDO_USER 为空，若退回 $HOME 会得到 /root，
+#    导致 /home/lgsj/xxx 被错误重映射到 /root/xxx
+resolve_user_home(){
+  local u=""
+  if [ -n "${SUDO_USER:-}" ]; then
+    u="$SUDO_USER"
+  elif [ -n "${DSH_HOME:-}" ]; then
+    u="$(basename "$(dirname "$DSH_HOME")")"
+  fi
+  local h=""
+  [ -n "$u" ] && h="$(getent passwd "$u" 2>/dev/null | cut -d: -f6)"
+  if [ -z "$h" ]; then
+    # 从 DSH_HOME 反推（.../home/<user>/.dsh）
+    case "$DSH_HOME" in
+      /home/*/.dsh) h="${DSH_HOME%/.dsh}" ;;
+    esac
+  fi
+  [ -z "$h" ] && h="$HOME"
+  printf '%s' "$h"
+}
+USER_HOME="$(resolve_user_home)"
+
+install_base(){
+  step "安装 DSH 底座（从 $BASE_REPO@$BASE_TAG）"
+  local tmp; tmp=$(mktemp -d)
+  local url="https://github.com/$BASE_REPO/releases/download/$BASE_TAG/dsh-base-${BASE_TAG#v}.tar.gz"
+  local mirror="https://gh-proxy.com/$url"
+  echo "  下载 $url"
+  if curl -fL --retry 3 -o "$tmp/base.tar.gz" "$url" 2>/dev/null; then
+    ok "直连下载成功"
+  elif curl -fL --retry 3 -o "$tmp/base.tar.gz" "$mirror" 2>/dev/null; then
+    ok "镜像下载成功"
+  else
+    err "底座下载失败，请手动下载后解包运行其 install.sh"; exit 1
+  fi
+  tar -xzf "$tmp/base.tar.gz" -C "$tmp"
+  # 底座的 install.sh 在解出的 <repo>-<ver>/ 目录里
+  local idir; idir=$(find "$tmp" -maxdepth 2 -name install.sh -printf '%h\n' | head -1)
+  [ -z "$idir" ] && { err "底座包里找不到 install.sh"; exit 1; }
+  bash "$idir/install.sh" --skip-restart
+  rm -rf "$tmp"
+}
+
+# =============================================================================
 step "0. 环境检查"
 # =============================================================================
 if [ ! -d "$PROFILE_DIR" ]; then
@@ -112,24 +159,26 @@ if [ "$HAS_VENV" = "1" ]; then
   ok "python3: $(python3 -V 2>&1)"
 fi
 
-# =============================================================================
-install_base(){
-  step "安装 DSH 底座（从 $BASE_REPO@$BASE_TAG）"
-  local tmp; tmp=$(mktemp -d)
-  local url="https://github.com/$BASE_REPO/releases/download/$BASE_TAG/dsh-base-${BASE_TAG#v}.tar.gz"
-  local mirror="https://gh-proxy.com/$url"
-  echo "  下载 $url"
-  if curl -fL --retry 3 -o "$tmp/base.tar.gz" "$url" 2>/dev/null; then
-    ok "直连下载成功"
-  elif curl -fL --retry 3 -o "$tmp/base.tar.gz" "$mirror" 2>/dev/null; then
-    ok "镜像下载成功"
-  else
-    err "底座下载失败，请手动下载后解包运行其 install.sh"; exit 1
+# 发行版依赖检查（本包不内联这些系统二进制，需目标机 apt 已有）
+APT_MISSING=""
+for b in ; do
+  [ -n "$b" ] || continue
+  if [ ! -e "$b" ]; then
+    APT_MISSING="$APT_MISSING $b"
   fi
-  tar -xzf "$tmp/base.tar.gz" -C "$tmp"
-  bash "$tmp"/install.sh --skip-restart
-  rm -rf "$tmp"
-}
+done
+if [ -n "$APT_MISSING" ]; then
+  warn "目标机缺少以下系统程序（本包不内联，需系统提供）："
+  for b in $APT_MISSING; do echo "      $b"; done
+  if [ "$IGNORE_APT" = "1" ]; then
+    warn "  已指定 --ignore-apt，继续安装（相关服务可能起不来）"
+  else
+    err "  请先安装：apt-get install -y wine nftables redis-server nginx iproute2"
+    err "  或加 --ignore-apt 强行继续"
+    exit 2
+  fi
+fi
+
 
 # =============================================================================
 step "1. 安装插件文件"
@@ -168,15 +217,33 @@ install_plugin_to(){
 install_plugin_to "$PROFILE_DIR" "宿主 profile"
 
 # 规格 #7：扇出到所有已存在账号
+ACCT_COUNT=0
+PENDING_ACCT=0
 if [ -d "$USERS_DIR" ]; then
   for u in "$USERS_DIR"/*/; do
+    [ -d "$u" ] || continue
     acct=$(basename "$u")
     up="$u/home/profiles/web"
-    [ -d "$up" ] || continue
+    if [ ! -d "$up" ]; then
+      warn "  账号 $acct 无 profiles/web，跳过（该账号可能尚未初始化）"
+      continue
+    fi
     install_plugin_to "$up" "账号 $acct"
+    ACCT_COUNT=$((ACCT_COUNT+1))
   done
+  [ "$ACCT_COUNT" -eq 0 ] && PENDING_ACCT=1
 else
-  warn "无多用户目录 $USERS_DIR"
+  # 🔴 新机首次安装时 $USERS_DIR 还不存在：多用户网关注册第一个账号后才会创建。
+  #    此时静默跳过会让"已装好"的结论变假 —— 宿主 profile 有插件、账号里没有。
+  warn "  无多用户目录 $USERS_DIR（尚未创建任何账号）"
+  PENDING_ACCT=1
+fi
+
+if [ "$PENDING_ACCT" = "1" ] && [ -n "$PLUGIN_DIR" ]; then
+  # 记录待补装，供 accounts-fanout.sh 在多用户网关注册账号后补齐
+  mkdir -p "$DSH_HOME/.publish-pending" 2>/dev/null || true
+  echo "$PKG_NAME|$PLUGIN_DIR" >> "$DSH_HOME/.publish-pending/fanout.list" 2>/dev/null || true
+  warn "  已登记待补装：账号创建后执行 accounts-fanout.sh 即可补齐（不装也行，仅影响账号级面板）"
 fi
 
 # =============================================================================
@@ -200,7 +267,66 @@ if [ "$HAS_VENV" = "1" ] && [ -d "$PAYLOAD/venv" ]; then
 fi
 
 # =============================================================================
-step "3. 后台服务"
+step "3. 还原绝对路径（fs overlay，自包含核心）"
+# =============================================================================
+# 🔴 关键：systemd unit 里写的是 /usr/local/sbin/xxx、/opt/zhihui、/home/xxx/.dsh/...
+#    这类绝对路径。包里按原路径存在 PAYLOAD/fs/ 下，这里原样铺回去。
+#    同时做路径前缀重映射：/home/lgsj/.dsh -> 本机 $DSH_HOME，/home/lgsj -> 本机用户 home
+#    （目标机的用户名/DSH 根未必和打包机一致）
+restore_fs_from_manifest(){
+  local mf="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/manifest.json"
+  [ -f "$mf" ] || { warn "无 manifest.json"; return 0; }
+  command -v python3 >/dev/null || { warn "无 python3，跳过 fs 还原"; return 0; }
+
+  python3 - "$mf" <<'PYEOF' > /tmp/_dsh_fs_plan.$$
+import json,sys
+m=json.load(open(sys.argv[1]))
+for e in m.get("fsEntries",[]):
+    print(e["src"]+"\t"+e["dst"]+"\t"+e.get("type","file"))
+PYEOF
+
+  local bakdir="/var/backups/dsh-${PKG_NAME}-${PKG_VERSION}"
+  local count=0
+  while IFS=$'\t' read -r src dst typ; do
+    [ -n "$src" ] || continue
+    local rel="${dst#fs/}"
+    local tgt="/$rel"
+    if [ "$rel" = "home/lgsj/.dsh" ] || case "$rel" in home/lgsj/.dsh/*) true;; *) false;; esac; then
+      tgt="$DSH_HOME${rel#home/lgsj/.dsh}"
+    elif [ "$rel" = "home/lgsj" ] || case "$rel" in home/lgsj/*) true;; *) false;; esac; then
+      tgt="$USER_HOME${rel#home/lgsj}"
+    fi
+    if [ "$DRY" = "1" ]; then ok "  [dry] $rel -> $tgt"; continue; fi
+    # 包内缺件判定：悬空软链接也算存在（-e 对悬空链接为假）
+    if [ ! -e "$PAYLOAD/$dst" ] && [ ! -L "$PAYLOAD/$dst" ]; then
+      warn "  缺件 $dst"; continue
+    fi
+    $SUDO mkdir -p "$(dirname "$tgt")"
+    if [ -e "$tgt" ] && [ ! -d "$tgt" ]; then
+      $SUDO mkdir -p "$bakdir$(dirname "$tgt")"
+      $SUDO cp -a "$tgt" "$bakdir$tgt" 2>/dev/null || true
+    fi
+    if [ "$typ" = "symlink" ]; then
+      local lk; lk="$(readlink "$PAYLOAD/$dst")"
+      $SUDO rm -f "$tgt"
+      $SUDO ln -sfn "$lk" "$tgt"
+    elif [ "$typ" = "dir" ]; then
+      $SUDO mkdir -p "$tgt"
+      $SUDO cp -a "$PAYLOAD/$dst/." "$tgt/"
+    else
+      $SUDO cp -af "$PAYLOAD/$dst" "$tgt"
+    fi
+    count=$((count+1))
+    ok "  $src -> $tgt"
+  done < /tmp/_dsh_fs_plan.$$
+  rm -f /tmp/_dsh_fs_plan.$$
+  ok "  fs overlay: 共还原 $count 项"
+}
+
+restore_fs_from_manifest
+
+# =============================================================================
+step "4. 后台服务"
 # =============================================================================
 fix_shared_service(){
   local name="$1"
@@ -216,11 +342,28 @@ fix_shared_service(){
   warn "  $name: 状态=$state，重写 unit 并重启"
   [ "$DRY" = "1" ] && return 0
   if [ -f "$PAYLOAD/services/$name.service" ]; then
-    $SUDO cp "$PAYLOAD/services/$name.service" "/etc/systemd/system/$name.service"
+    # 路径重映射：/home/lgsj/.dsh -> $DSH_HOME，/home/lgsj -> $USER_HOME
+    sed -e "s|/home/lgsj/\.dsh|$DSH_HOME|g" \
+        -e "s|/home/lgsj|$USER_HOME|g" \
+        "$PAYLOAD/services/$name.service" > /tmp/_dsh_svc_unit.$$
+    # 现场生成 __GEN__ 密钥
+    while grep -q '__GEN__' /tmp/_dsh_svc_unit.$$ 2>/dev/null; do
+      local v; v=$(gen_secret 32)
+      sed -i "0,/__GEN__/s|__GEN__|$v|" /tmp/_dsh_svc_unit.$$
+    done
+    $SUDO cp /tmp/_dsh_svc_unit.$$ "/etc/systemd/system/$name.service"
+    chmod 644 /tmp/_dsh_svc_unit.$$ 2>/dev/null || true
+    rm -f /tmp/_dsh_svc_unit.$$
   fi
   if [ -d "$PAYLOAD/services/$name.service.d" ]; then
     $SUDO mkdir -p "/etc/systemd/system/$name.service.d"
-    $SUDO cp -a "$PAYLOAD/services/$name.service.d/." "/etc/systemd/system/$name.service.d/"
+    for f in "$PAYLOAD/services/$name.service.d"/*; do
+      [ -f "$f" ] || continue
+      sed -e "s|/home/lgsj/\.dsh|$DSH_HOME|g" -e "s|/home/lgsj|$USER_HOME|g" \
+        "$f" > /tmp/_dsh_drop.$$
+      $SUDO cp /tmp/_dsh_drop.$$ "/etc/systemd/system/$name.service.d/$(basename "$f")"
+      rm -f /tmp/_dsh_drop.$$
+    done
   fi
   $SUDO systemctl daemon-reload
   $SUDO systemctl enable "$name" >/dev/null 2>&1 || true
@@ -254,7 +397,7 @@ else
 fi
 
 # =============================================================================
-step "4. 渲染配置与密钥（现场生成，规格 #10）"
+step "5. 渲染配置与密钥（现场生成，规格 #10）"
 # =============================================================================
 if [ -d "$PAYLOAD/services/env" ]; then
   mkdir -p "$DSH_HOME/publish-env"
@@ -283,7 +426,7 @@ if [ -d "$PAYLOAD/services/env" ]; then
 fi
 
 # =============================================================================
-step "5. 重启 DSH 使插件生效"
+step "6. 重启 DSH 使插件生效"
 # =============================================================================
 if [ "$SKIP_RESTART" = "0" ] && [ "$DRY" = "0" ]; then
   if systemctl is-enabled dsh-web >/dev/null 2>&1 || systemctl list-units --all | grep -q dsh-web; then
@@ -307,7 +450,10 @@ step "完成"
 # =============================================================================
 echo "  $PKG_NAME $PKG_VERSION 安装完成"
 [ -n "$PORTS" ] && echo "  端口: $PORTS"
-echo "  安装位置: 宿主 profile + $( [ -d "$USERS_DIR" ] && ls -1 "$USERS_DIR" | wc -l || echo 0 ) 个账号"
+echo "  安装位置: 宿主 profile + ${ACCT_COUNT} 个账号"
+if [ "$PENDING_ACCT" = "1" ] && [ -n "$PLUGIN_DIR" ]; then
+  echo "  ${YEL}注意${RST}: 当前无已初始化账号，账号级面板需在创建账号后跑 accounts-fanout.sh"
+fi
 echo
 echo "  验证："
 echo "    systemctl status ${SERVICES%% *} 2>/dev/null | head -5"

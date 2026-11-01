@@ -115,15 +115,38 @@ USER_HOME="$(resolve_user_home)"
 install_base(){
   step "安装 DSH 底座（从 $BASE_REPO@$BASE_TAG）"
   local tmp; tmp=$(mktemp -d)
-  local url="https://github.com/$BASE_REPO/releases/download/$BASE_TAG/dsh-base-${BASE_TAG#v}.tar.gz"
-  local mirror="https://gh-proxy.com/$url"
-  echo "  下载 $url"
-  if curl -fL --retry 3 -o "$tmp/base.tar.gz" "$url" 2>/dev/null; then
-    ok "直连下载成功"
-  elif curl -fL --retry 3 -o "$tmp/base.tar.gz" "$mirror" 2>/dev/null; then
-    ok "镜像下载成功"
-  else
-    err "底座下载失败，请手动下载后解包运行其 install.sh"; exit 1
+  # 🔴 资产名必须与发布脚本产出的名字一致：`{repo}-{ver}.tar.gz`
+  #    本包 BASE_REPO=imasonhk-spec/dsh、BASE_TAG=v0.2.0
+  #      => dsh-0.2.0.tar.gz
+  #    早期写死成 `dsh-base-${TAG#v}.tar.gz`，而 Release 里实际的资产名叫
+  #    `dsh-0.2.0.tar.gz`（dsh 仓的 repo 名就是 dsh，没有 base 后缀），
+  #    结果 --with-base 必然 404 —— 新机从零安装第一步就断。
+  #    这里改为从包名推导，同时保留旧名做兜底（远端若真叫 dsh-base-* 也能取到）。
+  local short="${BASE_REPO##*/}"
+  local ver="${BASE_TAG#v}"
+  local cands=("${short}-${ver}.tar.gz" "dsh-base-${ver}.tar.gz")
+  local got=""
+  for c in "${cands[@]}"; do
+    local u="https://github.com/$BASE_REPO/releases/download/$BASE_TAG/$c"
+    echo "  下载 $u"
+    if curl -fL --retry 3 --connect-timeout 15 -o "$tmp/base.tar.gz" "$u" 2>/dev/null; then
+      ok "直连下载成功（$c）"; got="1"; break
+    fi
+    echo "  试镜像 https://gh-proxy.com/$u"
+    if curl -fL --retry 3 --connect-timeout 15 -o "$tmp/base.tar.gz" "https://gh-proxy.com/$u" 2>/dev/null; then
+      ok "镜像下载成功（$c）"; got="1"; break
+    fi
+  done
+  if [ -z "$got" ]; then
+    err "底座下载失败（尝试过: ${cands[*]}）"
+    echo "  请手动下载后解包运行其 install.sh："
+    echo "    https://github.com/$BASE_REPO/releases/tag/$BASE_TAG"
+    exit 1
+  fi
+  # 下载完整性：GitHub 对大文件会给 HTML 错误页而不是 tar
+  if ! tar -tzf "$tmp/base.tar.gz" >/dev/null 2>&1; then
+    err "下载到的不是有效 tar.gz（可能是代理错误页），请重试或手动安装"
+    ls -la "$tmp/base.tar.gz"; exit 1
   fi
   tar -xzf "$tmp/base.tar.gz" -C "$tmp"
   # 底座的 install.sh 在解出的 <repo>-<ver>/ 目录里

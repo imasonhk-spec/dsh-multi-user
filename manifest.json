@@ -1,0 +1,22 @@
+{
+  "name": "dsh-multi-user",
+  "unit": "dsh-multi-user",
+  "version": "1.2.0",
+  "previousVersion": "1.1.2",
+  "title": "多用户网关插件",
+  "kind": "plugin",
+  "services": [],
+  "ports": [],
+  "pluginDir": "dsh-multi-user",
+  "hasVenv": false,
+  "hasNode": false,
+  "hasHarness": false,
+  "generatedAt": "2026-11-01T23:00:34+08:00",
+  "host": "lgsj",
+  "installScope": [
+    "host-profile",
+    "all-existing-accounts"
+  ],
+  "baseRepo": "imasonhk-spec/dsh",
+  "baseTag": "v0.2.0"
+}

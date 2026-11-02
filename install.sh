@@ -86,6 +86,60 @@ fi
 
 gen_secret(){ openssl rand -hex "${1:-24}" 2>/dev/null || head -c "${1:-24}" /dev/urandom | xxd -p | head -c $(( ${1:-24}*2 )); }
 
+# ---------------------------------------------------------------------------
+# 鲁棒下载：解决"网络间歇性连不上 release-assets.githubusercontent.com"
+#
+# 🔴 实测现象（14 号机，2026-11-02）：
+#    同一个 URL、同一条命令，第一次 `curl -L` 卡死超时（http=000），
+#    隔 30 秒再跑就 200 且完整下完 13.08 MB。
+#    更进一步：先取 302 的 Location 再单独打，反而失败；
+#    直接 `curl -L` 又成功 —— 说明是**链路抖动**，不是域名被墙、不是 URL 写错。
+#    所以不能靠"单次失败就放弃"，必须重试到成功或用尽次数。
+#
+# 参数：fetch <输出文件> <URL...>   （URL 可以是多个候选，依次尝试）
+# 返回：0 = 拿到有效文件；1 = 全失败
+# ---------------------------------------------------------------------------
+fetch(){
+  local out="$1"; shift
+  local urls=("$@")
+  local try=0
+  local conf=""
+  if [ -n "${GITHUB_TOKEN:-}" ]; then
+    conf="$(mktemp)"; chmod 600 "$conf"
+    printf 'header = "Authorization: Bearer %s"\n' "$GITHUB_TOKEN" > "$conf"
+  fi
+  for u in "${urls[@]}"; do
+    [ -z "$u" ] && continue
+    for attempt in 1 2 3 4 5; do
+      try=$((try+1))
+      echo "    [下载 $attempt/5] $u"
+      # 关键参数说明：
+      #   --retry-all-errors  连"连接被重置/超时"也重试（默认只重试 5xx）
+      #   --speed-limit/-time 60 秒内低于 1 KB/s 视为卡死，主动断开重来
+      if [ -n "$conf" ]; then
+        curl -sSL --retry 2 --retry-all-errors --retry-delay 2 \
+             --connect-timeout 20 --max-time 3600 \
+             --speed-limit 1024 --speed-time 60 \
+             -K "$conf" -o "$out" "$u" 2>/dev/null
+      else
+        curl -sSL --retry 2 --retry-all-errors --retry-delay 2 \
+             --connect-timeout 20 --max-time 3600 \
+             --speed-limit 1024 --speed-time 60 \
+             -o "$out" "$u" 2>/dev/null
+      fi
+      # 🔴 不能只看 curl 返回码：403/404 页面、代理错误页也会"成功"落盘。
+      #    gzip 文件必须以 1f 8b 开头，否则一律当失败重来。
+      if [ -s "$out" ] && [ "$(head -c2 "$out" | xxd -p)" = "1f8b" ]; then
+        [ -n "$conf" ] && rm -f "$conf"
+        return 0
+      fi
+      sleep $(( attempt * 2 ))
+    done
+  done
+  [ -n "$conf" ] && rm -f "$conf"
+  return 1
+}
+
 # =============================================================================
 # 前置函数定义（必须在 step 0 之前，bash 按顺序解析）
 # =============================================================================
@@ -115,39 +169,101 @@ USER_HOME="$(resolve_user_home)"
 install_base(){
   step "安装 DSH 底座（从 $BASE_REPO@$BASE_TAG）"
   local tmp; tmp=$(mktemp -d)
-  # 🔴 资产名必须与发布脚本产出的名字一致：`{repo}-{ver}.tar.gz`
-  #    本包 BASE_REPO=imasonhk-spec/dsh、BASE_TAG=v0.2.0
-  #      => dsh-0.2.0.tar.gz
-  #    早期写死成 `dsh-base-${TAG#v}.tar.gz`，而 Release 里实际的资产名叫
-  #    `dsh-0.2.0.tar.gz`（dsh 仓的 repo 名就是 dsh，没有 base 后缀），
-  #    结果 --with-base 必然 404 —— 新机从零安装第一步就断。
-  #    这里改为从包名推导，同时保留旧名做兜底（远端若真叫 dsh-base-* 也能取到）。
+
+  # 🔴 私有仓库的下载姿势（实测结论，别走弯路）：
+  #    1) 匿名访问：`/releases/download/<tag>/<asset>` 一律 **404**
+  #       （GitHub 对私有资源返回 404 而非 401，掩盖存在性 —— 极易误判成
+  #        "资产不存在/名字写错"，实测在 14 号机上正是这样卡住的）
+  #    2) 带 Authorization 打 `/releases/download/...`：**仍然 404**
+  #       —— 该路径是浏览器重定向链，不吃 Bearer 头
+  #    3) 唯一有效路径：**API 的 asset 端点**
+  #         GET /repos/{owner}/{repo}/releases/tags/{tag}      -> release id
+  #         GET /repos/{owner}/{repo}/releases/{id}/assets     -> asset id
+  #         GET /repos/{owner}/{repo}/releases/assets/{aid}
+  #             -H 'Accept: application/octet-stream'          -> 302 到签名 URL
+  #       实测：882 MB 包 3 分钟下完，tar 校验 2826 个条目正常。
   local short="${BASE_REPO##*/}"
   local ver="${BASE_TAG#v}"
   local cands=("${short}-${ver}.tar.gz" "dsh-base-${ver}.tar.gz")
-  local got=""
-  for c in "${cands[@]}"; do
-    local u="https://github.com/$BASE_REPO/releases/download/$BASE_TAG/$c"
-    echo "  下载 $u"
-    if curl -fL --retry 3 --connect-timeout 15 -o "$tmp/base.tar.gz" "$u" 2>/dev/null; then
-      ok "直连下载成功（$c）"; got="1"; break
-    fi
-    echo "  试镜像 https://gh-proxy.com/$u"
-    if curl -fL --retry 3 --connect-timeout 15 -o "$tmp/base.tar.gz" "https://gh-proxy.com/$u" 2>/dev/null; then
-      ok "镜像下载成功（$c）"; got="1"; break
-    fi
+
+  # 凭据来源优先级：GITHUB_TOKEN 环境变量 > ~/.ghtok > ~/.config/dsh/ghtok > /root/.ghtok
+  local tk=""
+  for f in "${GITHUB_TOKEN:-}" "$(cat "$HOME/.ghtok" 2>/dev/null)" \
+           "$(cat "$HOME/.config/dsh/ghtok" 2>/dev/null)" \
+           "$(cat /root/.ghtok 2>/dev/null)"; do
+    [ -n "$f" ] && { tk="$f"; break; }
   done
+  local got=""
+  local dcfg="$tmp/.dl.cfg"
+
+  if [ -n "$tk" ]; then
+    ok "已加载 GitHub 凭据（私有仓库）"
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/octet-stream"\n' "$tk" > "$dcfg"
+    chmod 600 "$dcfg"
+    local acfg="$tmp/.api.cfg"
+    printf 'header = "Authorization: Bearer %s"\nheader = "Accept: application/vnd.github+json"\n' "$tk" > "$acfg"
+    chmod 600 "$acfg"
+
+    local rid
+    rid=$(curl -sS --max-time 40 -K "$acfg" \
+            "https://api.github.com/repos/$BASE_REPO/releases/tags/$BASE_TAG" 2>/dev/null \
+          | python3 -c "import json,sys; print(json.load(sys.stdin).get('id',''))" 2>/dev/null)
+    if [ -n "$rid" ]; then
+      ok "release $BASE_TAG id=$rid"
+      for c in "${cands[@]}"; do
+        local aid
+        aid=$(curl -sS --max-time 40 -K "$acfg" \
+                "https://api.github.com/repos/$BASE_REPO/releases/$rid/assets" 2>/dev/null \
+              | C="$c" python3 -c "
+import json,os,sys
+want=os.environ.get('C','')
+for a in json.load(sys.stdin):
+    if a.get('name')==want:
+        print(a['id']); break
+" 2>/dev/null)
+        [ -z "$aid" ] && { echo "  资产 $c 不在该 release 中"; continue; }
+        echo "  下载 $c（asset id=$aid）"
+        if curl -sSL --retry 3 --retry-all-errors --retry-delay 2 \
+                --connect-timeout 20 --max-time 3600 \
+                --speed-limit 1024 --speed-time 60 \
+                -K "$dcfg" -o "$tmp/base.tar.gz" \
+                "https://api.github.com/repos/$BASE_REPO/releases/assets/$aid" 2>/dev/null \
+           && tar -tzf "$tmp/base.tar.gz" >/dev/null 2>&1; then
+          ok "下载完成并校验通过（$c, $(du -sm "$tmp/base.tar.gz" | cut -f1) MB）"
+          got="1"; break
+        fi
+        warn "  $c 下载不完整，换下一个候选"
+        rm -f "$tmp/base.tar.gz"
+      done
+    else
+      warn "  取 release 失败（token 权限不足？需要 repo 读权限）"
+    fi
+  else
+    warn "未找到 GitHub 凭据：若是私有仓库会 404（本批仓库已设为 public，通常无需 token）"
+  fi
+
+  # 匿名路径（仓库为 public 时走这条；也是无 token 场景的默认路径）
   if [ -z "$got" ]; then
-    err "底座下载失败（尝试过: ${cands[*]}）"
-    echo "  请手动下载后解包运行其 install.sh："
-    echo "    https://github.com/$BASE_REPO/releases/tag/$BASE_TAG"
+    local urls=()
+    for c in "${cands[@]}"; do
+      urls+=("https://github.com/$BASE_REPO/releases/download/$BASE_TAG/$c")
+      urls+=("https://gh-proxy.com/https://github.com/$BASE_REPO/releases/download/$BASE_TAG/$c")
+    done
+    if fetch "$tmp/base.tar.gz" "${urls[@]}" \
+       && tar -tzf "$tmp/base.tar.gz" >/dev/null 2>&1; then
+      ok "下载完成并校验通过（$(du -sm "$tmp/base.tar.gz" | cut -f1) MB）"
+      got="1"
+    fi
+  fi
+
+  if [ -z "$got" ]; then
+    err "底座下载失败（已重试多轮）"
+    echo "  仓库: https://github.com/$BASE_REPO/releases/tag/$BASE_TAG"
+    echo "  可在能上网的机器上手动下载该 tar.gz，拷到本机后执行："
+    echo "    tar -xzf <包名>.tar.gz && cd <包名> && ./install.sh"
     exit 1
   fi
-  # 下载完整性：GitHub 对大文件会给 HTML 错误页而不是 tar
-  if ! tar -tzf "$tmp/base.tar.gz" >/dev/null 2>&1; then
-    err "下载到的不是有效 tar.gz（可能是代理错误页），请重试或手动安装"
-    ls -la "$tmp/base.tar.gz"; exit 1
-  fi
+  rm -f "$dcfg" "${acfg:-}" 2>/dev/null || true
   tar -xzf "$tmp/base.tar.gz" -C "$tmp"
   # 底座的 install.sh 在解出的 <repo>-<ver>/ 目录里
   local idir; idir=$(find "$tmp" -maxdepth 2 -name install.sh -printf '%h\n' | head -1)
@@ -159,7 +275,20 @@ install_base(){
 # =============================================================================
 step "0. 环境检查"
 # =============================================================================
-if [ ! -d "$PROFILE_DIR" ]; then
+# 🔴 底座包不能做"DSH 是否已安装"的前置检查。
+#    实测（2026-11-02，14 号机从零验收）：拿到 dsh-base 包执行 install.sh，
+#    第 0 步就因为 $DSH_HOME/profiles/web 不存在而 exit 1，提示
+#    「这是一台没有 DSH 的机器。本包只含插件，不含 DSH 底座」—— 
+#    而它**本身就是底座**。新机从零装的第一步必然死在这里，
+#    且 --with-base 也救不了：底座包里 WITH_BASE 分支拉取的还是它自己。
+#    插件包保留该检查（它们确实需要先有底座）。
+if [ "$PKG_KIND" = "base" ]; then
+  if [ -d "$PROFILE_DIR" ]; then
+    ok "已存在 DSH profile，将就地升级/覆盖: $PROFILE_DIR"
+  else
+    ok "全新安装：本包即 DSH 底座，将创建 $PROFILE_DIR"
+  fi
+elif [ ! -d "$PROFILE_DIR" ]; then
   if [ "$WITH_BASE" = "1" ]; then
     warn "未检测到 DSH（$PROFILE_DIR），将先安装底座"
     install_base
@@ -214,27 +343,99 @@ install_plugin_to(){
 
   if [ -n "$PLUGIN_DIR" ] && [ -d "$PAYLOAD/plugin" ]; then
     for pd in "$PAYLOAD"/plugin/*/; do
+      [ -d "$pd" ] || continue
       local bn; bn=$(basename "$pd")
-      # 判定目标命名空间：@local/* 还是顶层
-      if echo "$PLUGIN_DIR" | grep -q '^@local/'; then
-        mkdir -p "$nm/@local"
-        rm -rf "$nm/@local/$bn"
-        cp -a "$pd" "$nm/@local/$bn"
-      else
-        rm -rf "$nm/$bn"
-        cp -a "$pd" "$nm/$bn"
+      # 🔴 落点必须按该插件 package.json 里的 **真实包名** 决定，不能一律套用
+      #    本包的 PLUGIN_DIR 命名空间。
+      #    实测 dsh-workbench-bot 的 PLUGIN_DIR=@local/dsh-workbench-bot，
+      #    它还带 extra_plugins=["ds-bot"]；早期写法会把 ds-bot 也塞进
+      #    node_modules/@local/ds-bot —— 而 profile 里声明的是 "ds-bot"，
+      #    loader 去 node_modules/ds-bot 找，找不到 → 该 Bot 静默消失。
+      local realname="$bn"
+      if [ -f "$pd/package.json" ] && command -v python3 >/dev/null 2>&1; then
+        local rn; rn=$(python3 -c "import json,sys;print(json.load(open(sys.argv[1],encoding='utf-8')).get('name',''))" "$pd/package.json" 2>/dev/null || true)
+        [ -n "$rn" ] && realname="$rn"
       fi
+      # 兜底：package.json 缺失时沿用旧逻辑（按 PLUGIN_DIR 命名空间）
+      case "$realname" in
+        */*) : ;;
+        *) [ "$bn" = "${PLUGIN_DIR##*/}" ] && realname="$PLUGIN_DIR" ;;
+      esac
+      local rel="${realname#@}"
+      case "$realname" in
+        @*) local tgt="$nm/${rel%%/*}/${rel#*/}" ;;
+        *)  local tgt="$nm/$realname" ;;
+      esac
+      rm -rf "$tgt"
+      mkdir -p "$(dirname "$tgt")"
+      cp -a "$pd" "$tgt"
+      ok "  $label: $realname -> ${tgt#$target_profile/}"
     done
     # 权限：插件目录必须归 DSH 属主，否则 harness 读不了
     if [ "$(id -u)" -eq 0 ] && [ -n "$DSH_OWNER" ]; then
       chown -R "$DSH_OWNER" "$nm/@local" 2>/dev/null || true
-      [ -n "$PLUGIN_DIR" ] && case "$PLUGIN_DIR" in
+      case "$PLUGIN_DIR" in
         @local/*) : ;;
-        *) chown -R "$DSH_OWNER" "$nm/$PLUGIN_DIR" 2>/dev/null || true ;;
+        *) [ -n "$PLUGIN_DIR" ] && chown -R "$DSH_OWNER" "$nm/$PLUGIN_DIR" 2>/dev/null || true ;;
       esac
     fi
-    ok "  $label: $(ls "$PAYLOAD/plugin" | tr '\n' ' ')"
+
+    # 🔴🔴 「包文件在位」≠「已加载」。
+    #    DSH 的 loader 按 package.json 的 dsh.profile.bundles 决定挂载哪些插件；
+    #    只把目录拷进 node_modules 而不注册 bundle，面板永远不会出现，
+    #    且**没有任何报错**（这是本机长期踩的坑，见记忆里的插件加载机制）。
+    #    bundles 还必须遵守「单点声明」：包自身 patch 已 insert 同名 id 时，
+    #    profile 再插会让 Loader 崩（repeated id）。
+    register_bundles "$target_profile" "$label"
   fi
+}
+
+register_bundles(){
+  local prof="$1" label="$2"
+  local pj="$prof/package.json"
+  [ -f "$pj" ] || { warn "  $label 无 package.json，跳过 bundle 注册"; return 0; }
+  command -v python3 >/dev/null || { warn "  无 python3，跳过 bundle 注册"; return 0; }
+
+  # 本包要注册的 bundle id 列表：plugin_dir + extra_plugins
+  local ids="$PLUGIN_DIR"
+  if [ -f "$PAYLOAD/extra-bundles.txt" ]; then
+    while IFS= read -r l; do
+      [ -n "$l" ] && ids="$ids $l"
+    done < "$PAYLOAD/extra-bundles.txt"
+  fi
+  [ -z "$(echo "$ids" | tr -d ' ')" ] && return 0
+
+  local out
+  out=$(python3 - "$pj" $ids <<'PYEOF'
+import json, os, sys
+pj, ids = sys.argv[1], sys.argv[2:]
+try:
+    d = json.load(open(pj, encoding="utf-8"))
+except Exception as e:
+    print("ERR\t%s" % e); sys.exit(0)
+bundles = d.setdefault("dsh", {}).setdefault("profile", {}).setdefault("bundles", [])
+added = []
+for i in ids:
+    if not i: continue
+    if i in bundles: continue
+    # 🔴 顺序敏感：插件必须排在 @deepseek-ai/dsh-base 与 dsh-web-app 之后，
+    #    否则其 patch 会在核心插件树就绪前 apply，表现是 fiber=failed。
+    bundles.append(i)
+    added.append(i)
+if added:
+    tmp = pj + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, pj)
+print("OK\t%s" % " ".join(added))
+PYEOF
+)
+  case "$out" in
+    OK*) local a="${out#OK	}"
+         [ -n "$a" ] && ok "  $label: bundle 已注册 [$a]" \
+                     || ok "  $label: bundle 已存在，无需重复注册" ;;
+    ERR*) warn "  $label: bundle 注册失败（${out#ERR	}）" ;;
+  esac
 }
 
 install_plugin_to "$PROFILE_DIR" "宿主 profile"
@@ -305,13 +506,35 @@ restore_fs_from_manifest(){
 import json,sys
 m=json.load(open(sys.argv[1]))
 for e in m.get("fsEntries",[]):
-    print(e["src"]+"\t"+e["dst"]+"\t"+e.get("type","file"))
+    # 第 1 列 src / 第 2 列 dst / 第 3 列 type / 第 4 列 basename（仅 harness-dir 用）
+    print("\t".join([e.get("src",""), e.get("dst",""),
+                     e.get("type","file"), e.get("basename","")]))
 PYEOF
 
   local bakdir="/var/backups/dsh-${PKG_NAME}-${PKG_VERSION}"
   local count=0
-  while IFS=$'\t' read -r src dst typ; do
+  while IFS=$'\t' read -r src dst typ hbase; do
     [ -n "$src" ] || continue
+    # 🔴 harness 是独立条目（dst="harness"，不是 fs/ 前缀）：
+    #    它必须落到 $USER_HOME/<basename>，也就是 dsh-web.service 的
+    #    WorkingDirectory。早期它只被打进 PAYLOAD/harness 却没有任何
+    #    fsEntry，安装器根本不认这个目录 —— 2091 MB 采了白采，
+    #    目标机上 WorkingDirectory 不存在，`cd` 失败，服务起不来。
+    #    ⚠️ 落点目录名必须来自 manifest 的 basename（如
+    #       deepseek-harness.dsh-v0.1.7-alpha.2），不能写死 "harness" ——
+    #       否则装到 $USER_HOME/harness，WorkingDirectory 依然对不上。
+    if [ "$typ" = "harness-dir" ]; then
+      local hbn="${hbase:-harness}"
+      local htgt="$USER_HOME/$hbn"
+      if [ "$DRY" = "1" ]; then ok "  [dry] harness -> $htgt"; continue; fi
+      if [ ! -d "$PAYLOAD/harness" ]; then warn "  缺件 PAYLOAD/harness"; continue; fi
+      $SUDO mkdir -p "$htgt"
+      $SUDO cp -a "$PAYLOAD/harness/." "$htgt/"
+      [ -n "${DSH_OWNER:-}" ] && $SUDO chown -R "$DSH_OWNER" "$htgt" 2>/dev/null || true
+      count=$((count+1))
+      ok "  harness -> $htgt ($(du -sm "$htgt" 2>/dev/null | cut -f1) MB)"
+      continue
+    fi
     local rel="${dst#fs/}"
     local tgt="/$rel"
     if [ "$rel" = "home/lgsj/.dsh" ] || case "$rel" in home/lgsj/.dsh/*) true;; *) false;; esac; then
@@ -338,6 +561,18 @@ PYEOF
       $SUDO cp -a "$PAYLOAD/$dst/." "$tgt/"
     else
       $SUDO cp -af "$PAYLOAD/$dst" "$tgt"
+      # 🔴 脚本类文件里的绝对路径必须重映射。
+      #    实测 dsh-web-start.sh 正文写死 `cd /home/lgsj/deepseek-harness.dsh-v0.1.7-alpha.2`，
+      #    若目标机用户名不是 lgsj，服务起来后 cd 到不存在的目录 → 立即退出。
+      #    unit 文件在上面的 fix_shared_service() 里已做同样处理，这里补齐 fs 文件。
+      case "$tgt" in
+        *.sh)
+          if grep -q '/home/lgsj' "$tgt" 2>/dev/null; then
+            $SUDO sed -i -e "s|/home/lgsj/\.dsh|$DSH_HOME|g" \
+                          -e "s|/home/lgsj|$USER_HOME|g" "$tgt"
+          fi
+          ;;
+      esac
     fi
     count=$((count+1))
     ok "  $src -> $tgt"

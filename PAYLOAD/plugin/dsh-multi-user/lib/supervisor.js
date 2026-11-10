@@ -15,22 +15,19 @@
  */
 
 import { spawn } from 'node:child_process'
-import { spawnSync as __wbSpawnSync } from 'node:child_process'
 import {
+  appendFileSync,
   chmodSync,
   copyFileSync,
   cpSync,
   existsSync,
-  lstatSync, // WBKB_IMPORT
   mkdirSync,
   openSync,
   readFileSync,
-  readlinkSync, // WBKB_IMPORT
   readdirSync,
   rmSync,
   statSync,
   symlinkSync,
-  unlinkSync, // WBKB_IMPORT
   writeFileSync,
 } from 'node:fs'
 import { createServer, request as httpRequest } from 'node:http'
@@ -314,6 +311,18 @@ export function createSupervisor(config, deps = {}) {
     if (!existsSync(config.usersDir)) mkdirSync(config.usersDir, { recursive: true, mode: 0o700 })
   }
 
+  // Persist process identity and fixed reasons without credentials or user content.
+  function lifecycle(event, record, details = {}) {
+    try {
+      appendFileSync(join(config.logDir, 'instance-lifecycle.jsonl'), `${JSON.stringify({
+        at: new Date().toISOString(), event, username: record.username,
+        pid: record.child?.pid ?? null, port: record.port ?? null, ...details,
+      })}\n`, { mode: 0o600 })
+    } catch {
+      logger.warn?.('dsh-multi-user: could not persist instance lifecycle event')
+    }
+  }
+
   /** The user's private harness home, created on demand. */
   function homeOf(user) {
     if (typeof user.homeDir === 'string' && user.homeDir.length > 0) return user.homeDir
@@ -384,27 +393,6 @@ export function createSupervisor(config, deps = {}) {
       } catch (error) {
         logger.warn?.(`dsh-multi-user: could not seed ${name} for ${user.username}: ${error.message}`)
       }
-    }
-
-    // ── wb-seed: 新账号播种主 profile 的插件集（含 dsh-workbench 与各能力包） ──
-    try {
-      const __wbSeedScript = '/home/lgsj/wb_seed_account_profile.py'
-      if (existsSync(__wbSeedScript)) {
-        const __wbSeed = __wbSpawnSync('python3', [__wbSeedScript, user.username, '--quiet'], {
-          timeout: 300000,
-          encoding: 'utf8',
-        })
-        if (__wbSeed.status === 0) {
-          logger.info?.(`dsh-multi-user: seeded profile apps for ${user.username}`)
-        } else {
-          logger.warn?.(
-            `dsh-multi-user: profile seed for ${user.username} exited `
-            + `${__wbSeed.status ?? __wbSeed.signal}: ${String(__wbSeed.stderr ?? '').trim().slice(-400)}`,
-          )
-        }
-      }
-    } catch (error) {
-      logger.warn?.(`dsh-multi-user: profile seed skipped for ${user.username}: ${error.message}`)
     }
     return copied
   }
@@ -672,15 +660,6 @@ export function createSupervisor(config, deps = {}) {
   }
 
   async function syncProfile(user) {
-    // WBKB_SYNC: 账号知识库资产与「是否镜像宿主 profile」解耦。inheritProfile=false
-    // 只表示不把宿主插件集搬进账号，不代表账号不需要自己的 sidecar 配置；原实现
-    // 把 provision 放在本函数后半段，早退时整段跳过 → 新账号无
-    // raganything/config.json → KB 面板「连接失败，文档数量未知」。
-    try {
-      ensureRagSidecarConfig(user, homeOf(user))
-    } catch (error) {
-      logger.warn?.(`dsh-multi-user: could not provision the RAG sidecar config for ${user.username}: ${error.message}`)
-    }
     if (!config.inheritProfile) return { synced: false, reason: 'inheritProfile is off' }
     const hostHome = deps.hostHome?.()
     if (typeof hostHome !== 'string' || hostHome.length === 0) {
@@ -985,47 +964,10 @@ export function createSupervisor(config, deps = {}) {
    * `sidecarPortBase + slot` and a fresh 64-hex token. An existing config is
    * never rebuilt — only its `port` is re-aligned with the account's slot.
    */
-  /**
-   * WBKB_LINKS: venv 与 models 是每个账号都要用、但不该各存一份的大件。宿主把
-   * 它们放在 <hostHome>/raganything/ 下，账号侧只建软链。原先只靠
-   * linkSeedPaths（userSeedLinks 为空时什么都不做），新账号于是没有
-   * <ragHome>/venv/bin/python，spawnSidecar 报 "python interpreter not found"。
-   */
-  function ensureRagSharedLinks(dir) {
-    try {
-      const hostHome = deps.hostHome?.()
-      if (typeof hostHome !== 'string' || hostHome.length === 0) return
-      for (const name of ['venv', 'models']) {
-        const link = join(dir, name)
-        const target = join(hostHome, 'raganything', name)
-        if (!existsSync(target)) continue
-        try {
-          if (lstatSync(link).isSymbolicLink()) {
-            if (readlinkSync(link) === target) continue
-            unlinkSync(link)
-          } else {
-            continue // 实体目录：历史上真装过，不碰
-          }
-        } catch {
-          // 不存在 → 往下建
-        }
-        try {
-          symlinkSync(target, link)
-          logger.info?.(`dsh-multi-user: linked ${link} → ${target}`)
-        } catch (error) {
-          logger.warn?.(`dsh-multi-user: could not link ${link}: ${error.message}`)
-        }
-      }
-    } catch (error) {
-      logger.warn?.(`dsh-multi-user: could not link the shared RAG bulk: ${error.message}`)
-    }
-  }
-
   function ensureRagSidecarConfig(user, home) {
     const template = join(config.dataDir, 'raganything-config.template.json')
     if (!existsSync(template)) return false
     const dir = join(home, 'raganything')
-    ensureRagSharedLinks(dir)
     const file = join(dir, 'config.json')
     const slot = Number.isInteger(user.slot) ? user.slot : 0
     const port = (config.sidecarPortBase ?? 32000) + slot
@@ -1115,20 +1057,6 @@ export function createSupervisor(config, deps = {}) {
       user = { ...user, port }
       record.port = port
       // Bring the account's application set level with the host before booting.
-      // WBKB_START: 不依赖 syncProfileOnStart / syncProfile 的早退路径，启动前
-      // 无条件核对本账号的知识库运行时；缺序号时先认领，避免多账号挤在同一端口。
-      if (!Number.isInteger(user.slot) && typeof deps.claimSlot === 'function') {
-        try {
-          user = { ...user, slot: await deps.claimSlot(user.username) }
-        } catch (error) {
-          logger.warn?.(`dsh-multi-user: could not allocate an ordinal for ${user.username}: ${error.message}`)
-        }
-      }
-      try {
-        ensureRagSidecarConfig(user, home)
-      } catch (error) {
-        logger.warn?.(`dsh-multi-user: could not provision the RAG sidecar config for ${user.username}: ${error.message}`)
-      }
       if (config.syncProfileOnStart) await syncProfile(user)
       // Ordinary accounts use the administrator's models; see syncAdminModels.
       if (config.inheritAdminModels !== false) syncAdminModels(user, home)
@@ -1166,6 +1094,7 @@ export function createSupervisor(config, deps = {}) {
       }
       child.unref()
       record.child = child
+      lifecycle('spawn', record)
 
       // Give the port back the moment the child is really gone — released on the
       // `exit` event rather than at kill time, because a SIGTERM'd child keeps
@@ -1180,7 +1109,8 @@ export function createSupervisor(config, deps = {}) {
       // refreshes `lastUsed` on reuse, so the idle reaper never got to drop the
       // poisoned record either. The identity check keeps a rebuild that already
       // replaced this record safe: only OUR record is removed.
-      child.once('exit', () => {
+      child.once('exit', (code, signal) => {
+        lifecycle('exit', record, { code, signal, reason: record.stopReason ?? 'unexpected_exit' })
         releasePort(record.port)
         record.exitedAt = Date.now()
         if (instances.get(user.username) === record) instances.delete(user.username)
@@ -1210,6 +1140,7 @@ export function createSupervisor(config, deps = {}) {
           if (result.cookie !== undefined) {
             record.cookie = result.cookie
             record.ready = true
+            lifecycle('ready', record)
             logger.info?.(`dsh-multi-user: instance for ${user.username} ready on 127.0.0.1:${port}`)
             return record
           }
@@ -1221,7 +1152,7 @@ export function createSupervisor(config, deps = {}) {
       return await Promise.race([ready, spawnFailure])
     } catch (error) {
       record.lastError = error.message
-      killRecord(record)
+      killRecord(record, 'startup_failed')
       // A failure before spawn leaves no child, so no `exit` event will come to
       // release the reservation — do it here. (If a child does exist, its own
       // `exit` handler releases, which is idempotent with this.)
@@ -1232,9 +1163,11 @@ export function createSupervisor(config, deps = {}) {
     }
   }
 
-  function killRecord(record, signal = 'SIGTERM') {
+  function killRecord(record, reason, signal = 'SIGTERM') {
     const child = record?.child
     if (child === undefined || child.exitCode !== null || child.signalCode !== null) return
+    record.stopReason = reason
+    lifecycle('stop', record, { reason, signal })
     try {
       // Detached children lead their own process group; kill the group so the
       // `pnpm -> node -> tsx` chain dies together rather than orphaned.
@@ -1255,7 +1188,7 @@ export function createSupervisor(config, deps = {}) {
     for (const [username, record] of [...instances]) {
       if (record.ready && now - record.lastUsed > ttl) {
         logger.info?.(`dsh-multi-user: reaping idle instance for ${username}`)
-        killRecord(record)
+        killRecord(record, 'idle_timeout')
         instances.delete(username)
       }
     }
@@ -1281,9 +1214,10 @@ export function createSupervisor(config, deps = {}) {
       }
       const existing = instances.get(user.username)
       if (existing !== undefined && existing.ready) {
+        existing.lastUsed = Date.now()
         // Liveness before reuse. The exit handler above already drops records
-        // of children that died, so this covers the residue: an exit event not
-        // yet delivered, and an instance that is alive but no longer answering.
+        // of children that died. A slow HTTP probe only reports degradation;
+        // it must not terminate a live instance and its background work.
         // Probing shares one in-flight promise (no stampede) and is throttled,
         // because this sits on the request path.
         if (existing.probe === undefined && Date.now() - (existing.probedAt ?? 0) > INSTANCE_PROBE_MS) {
@@ -1293,21 +1227,16 @@ export function createSupervisor(config, deps = {}) {
           })
         }
         if (existing.probe !== undefined && (await existing.probe) === false) {
-          logger.warn?.(
-            `dsh-multi-user: instance for ${user.username} is not answering on 127.0.0.1:${existing.port}; rebuilding it`,
-          )
-          killRecord(existing)
-          if (instances.get(user.username) === existing) instances.delete(user.username)
-          // Re-enter through acquire(): if a concurrent request already owns a
-          // startup placeholder for this account, acquire() waits for that one
-          // instead of spawning a second child on the same port.
-          return await api.acquire(user)
+          if (instances.get(user.username) !== existing) return await api.acquire(user)
+          // A slow HTTP root is not proof of process death; preserve in-flight work.
+          lifecycle('probe_failed_preserved', existing)
+          logger.warn?.(`dsh-multi-user: instance for ${user.username} did not answer the probe; preserving the process and in-flight work`)
         }
         // The host may have gained or lost an application since this instance
         // started. That set is fixed at boot, so mirroring it costs a restart.
         if (config.syncProfileOnStart && (await syncProfile({ ...user, port: existing.port })).changed === true) {
           logger.info?.(`dsh-multi-user: application set changed for ${user.username}; restarting its instance`)
-          killRecord(existing)
+          killRecord(existing, 'profile_sync')
           instances.delete(user.username)
           const restarted = await start(user)
           return { port: restarted.port, cookie: restarted.cookie, hostMode: false }
@@ -1339,7 +1268,7 @@ export function createSupervisor(config, deps = {}) {
     stop(username) {
       const record = instances.get(username)
       if (record === undefined) return false
-      killRecord(record)
+      killRecord(record, 'explicit_stop')
       instances.delete(username)
       return true
     },
@@ -1348,7 +1277,7 @@ export function createSupervisor(config, deps = {}) {
     async stopAll() {
       stopped = true
       if (reaper !== null) clearInterval(reaper)
-      for (const record of instances.values()) killRecord(record)
+      for (const record of instances.values()) killRecord(record, 'gateway_dispose')
       instances.clear()
     },
 

@@ -1,4 +1,4 @@
-# dsh-multi-user 1.2.0
+# dsh-multi-user 1.2.1
 
 多用户网关插件
 
@@ -20,8 +20,8 @@
 ## 安装
 
 ```bash
-tar -xzf dsh-multi-user-1.2.0.tar.gz
-cd dsh-multi-user-1.2.0
+tar -xzf dsh-multi-user-1.2.1.tar.gz
+cd dsh-multi-user-1.2.1
 sudo ./install.sh
 ```
 

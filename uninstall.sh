@@ -3,7 +3,7 @@
 set -euo pipefail
 
 PKG_NAME="dsh-multi-user"
-PKG_VERSION="1.2.0"
+PKG_VERSION="1.2.1"
 PLUGIN_DIR="dsh-multi-user"
 SERVICES=""
 

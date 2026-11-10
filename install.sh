@@ -12,7 +12,7 @@
 set -euo pipefail
 
 PKG_NAME="dsh-multi-user"
-PKG_VERSION="1.2.0"
+PKG_VERSION="1.2.1"
 PKG_KIND="plugin"
 PLUGIN_DIR="dsh-multi-user"
 SERVICES=""
@@ -584,6 +584,136 @@ PYEOF
 restore_fs_from_manifest
 
 # =============================================================================
+# 🔴 3a. 合并已有 bundle 声明（重装底座不能把已装插件抹掉）
+# =============================================================================
+# fs overlay 会把**净化版** profile package.json 铺到目标机，它的
+# dsh.profile.bundles 只含底座核心（@deepseek-ai/dsh-base + dsh-web-app）。
+# 如果这台机器之前装过业务插件包，那些 bundle 就在这一瞬间被抹掉了 ——
+# 表现是"重装底座后所有面板突然全没了"，而且**没有任何报错**。
+#
+# 做法：铺之前先读旧 package.json 的 bundles，铺完把「node_modules 里真实
+# 存在」的那些补回去。判据必须是真实存在，不能只信旧声明（旧声明里可能
+# 残留已经删掉的插件，补回去会让 loader 刷 cannot resolve）。
+merge_existing_bundles(){
+  local pj="$PROFILE_DIR/package.json"
+  [ -f "$pj" ] || return 0
+  [ "$DRY" = "1" ] && { ok "  [dry] would merge existing bundles"; return 0; }
+  command -v python3 >/dev/null || return 0
+  local bak="${DSH_HOME}/.publish-pending/package.json.pre-${PKG_NAME}-$(date +%Y%m%d%H%M%S)"
+  mkdir -p "$(dirname "$bak")" 2>/dev/null || true
+  cp -a "$pj" "$bak" 2>/dev/null || true
+  local out
+  out=$(python3 - "$pj" "$PROFILE_DIR/node_modules" <<'PYEOF'
+import json, os, sys
+pj, nm = sys.argv[1], sys.argv[2]
+try:
+    d = json.load(open(pj, encoding="utf-8"))
+except Exception as e:
+    print("ERR\t%s" % e); sys.exit(0)
+prof = d.setdefault("dsh", {}).setdefault("profile", {})
+cur = prof.get("bundles") or []
+
+def resolvable(name):
+    """bundle 名能否在 node_modules 里解析到实体目录"""
+    if name.startswith("@") and "/" in name:
+        sc, pk = name.split("/", 1)
+        return os.path.isdir(os.path.join(nm, sc, pk))
+    return os.path.isdir(os.path.join(nm, name))
+
+# 1) 清掉当前列表里**不可解析**的（净化版理论上不会有，防御性处理）
+kept = [b for b in cur if resolvable(b)]
+lost = [b for b in cur if b not in kept]
+
+# 2) 从 node_modules 里**反扫**出所有声明了 dsh.bundle 的包，补进 lists
+#    这比"读旧 package.json"更硬：即使旧声明丢了，只要文件在就能补回来。
+found = []
+# 扫描 node_modules 下两层：顶层散包（node_modules/x/package.json, depth=1）
+# 与 scope 包（node_modules/@scope/x/package.json, depth=2）。
+# 🔴 早先写 `if depth >= 2: dirs[:] = []`，导致 depth=2 这一层**没被读取就剪枝**，
+#    @local/* 这类带 scope 的插件全部漏掉（实测 14 号机复跑时 huiwen-ppt 没补回）。
+for root, dirs, files in os.walk(nm):
+    depth = root[len(nm):].count(os.sep)
+    if root != nm and depth >= 2:
+        dirs[:] = []          # 不再往下（depth=2 本身要读，depth=3 才剪）
+    if "package.json" not in files or depth > 2:
+        continue
+    try:
+        pkg = json.load(open(os.path.join(root, "package.json"), encoding="utf-8"))
+    except Exception:
+        continue
+    if not (pkg.get("dsh") or {}).get("bundle"):
+        continue
+    n = pkg.get("name")
+    if n and n not in kept and n not in found:
+        found.append(n)
+
+merged = kept + found
+prof["bundles"] = merged
+if merged != cur or lost or found:
+    if "dependencies" not in d and not merged:
+        pass
+    tmp = pj + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(d, f, ensure_ascii=False, indent=2)
+        f.write("\n")
+    os.replace(tmp, pj)
+print("OK\tkept=%d found=%d lost=%s" % (len(kept), len(found), ",".join(lost) or "-"))
+PYEOF
+)
+  case "$out" in
+    OK*)
+      local info="${out#OK	}"
+      ok "  bundle 合并：$info"
+      case "$info" in
+        *found=0*) : ;;
+        *) warn "  发现 node_modules 里已存在但未声明的插件，已补进 bundles" ;;
+      esac
+      ;;
+    ERR*) warn "  bundle 合并失败（${out#ERR	}）" ;;
+  esac
+  [ -n "${DSH_OWNER:-}" ] && chown "$DSH_OWNER" "$pj" 2>/dev/null || true
+}
+
+# 只在底座包（会覆盖 profile 骨架）时才需要合并；
+# 插件包的 install_plugin_to/register_bundles 本身就是增量写，不会抹掉别人。
+if [ "$PKG_KIND" = "base" ]; then
+  merge_existing_bundles
+fi
+
+# =============================================================================
+# 🔴 3b. 修正 DSH 目录所有权（新机必踩，且报错极不直观）
+# =============================================================================
+# 安装器以 root 跑，`$SUDO mkdir -p "$tgt"` 会把**新建的每一层目录**都记成
+# root:root。而 dsh-web.service 是 `User=lgsj` 跑的，于是启动即：
+#     EACCES: permission denied, open '/home/lgsj/.dsh/.credentials.yaml.lock'
+# 服务起来后立刻退出、systemd 无限重启，journal 里只有这一行 EACCES，
+# **完全不会提示"目录属主不对"**。
+# （实测 14 号机 2026-11-02：restart counter 涨到 6，端口始终 0 监听）
+#
+# 只对「本包铺下去的 DSH 前缀」修属主，不碰家目录其它内容：
+# 用 `find -exec chown` 而不是 `chown -R`，且不跟随软链。
+fix_ownership(){
+  [ "$DRY" = "1" ] && { ok "  [dry] would fix ownership of $DSH_HOME"; return 0; }
+  [ -n "${DSH_OWNER:-}" ] || return 0
+  [ "$(id -u)" -eq 0 ] || warn "  非 root，跳过所有权修正（可能起不来）"
+  if [ -d "$DSH_HOME" ]; then
+    find "$DSH_HOME" \( -type d -o -type f \) -exec chown "$DSH_OWNER" {} + 2>/dev/null || true
+    ok "  $DSH_HOME 所有权 -> $DSH_OWNER"
+  fi
+  # 每账号的 profile 目录同理（扇出时装过的那些）
+  if [ -d "$USERS_DIR" ]; then
+    find "$USERS_DIR" -path '*/profiles/*' \( -type d -o -type f \) \
+      -exec chown "$DSH_OWNER" {} + 2>/dev/null || true
+  fi
+  # 便携 node / npm-global 若被 root 拷进来，pnpm 也跑不动
+  for d in /usr/local/node "$USER_HOME/.npm-global"; do
+    [ -d "$d" ] || continue
+    find "$d" \( -type d -o -type f \) -exec chown "$DSH_OWNER" {} + 2>/dev/null || true
+  done
+}
+fix_ownership
+
+# =============================================================================
 step "4. 后台服务"
 # =============================================================================
 fix_shared_service(){
@@ -631,6 +761,144 @@ fix_shared_service(){
     ok "  $name: 已修复并启动"
   else
     err "  $name: 启动失败，见 journalctl -u $name -n 30"
+    # 🔴 nginx 类服务失败要单独兜底。
+    #    实测 14 号机（2026-11-02）：dsh-proxy 起不来，根因是打包进去的
+    #    /etc/nginx/dsh-proxy.conf 里有两行 include：
+    #        include /etc/nginx/conf.d/dsh-rag-users.conf;
+    #        include /etc/nginx/sites-enabled/dsh-web;
+    #    这两个文件**是源机专属配置**，而且 sites-enabled/dsh-web 里硬编码了
+    #        listen 10.18.105.4:3080;  listen 100.100.8.6:3080;
+    #    —— 目标机根本没有这些地址。硬搬过去 100% 起不来。
+    #    正确处理：检测 include 目标缺失/不可用就换成**自适应的最小可用配置**，
+    #    只做「3082 -> 127.0.0.1:3080」这一层反代，不去复刻源机的多网卡布局。
+    if [ "$name" = "dsh-proxy" ]; then
+      repair_nginx_proxy
+    fi
+  fi
+}
+
+repair_nginx_proxy(){
+  command -v nginx >/dev/null 2>&1 || return 0
+  local conf=/etc/nginx/dsh-proxy.conf
+  [ -f "$conf" ] || return 0
+  # 先看原配置到底能不能过 —— 能过就一个字都不改（源机重装时走这条路）
+  if $SUDO /usr/sbin/nginx -c "$conf" -t >/dev/null 2>&1; then
+    ok "  dsh-proxy 配置本机可用，保持原样"
+    return 0
+  fi
+
+  # 🔴🔴 上游端口必须是 **3090（多用户网关）**，不是 3080（宿主实例）。
+  #     8.6 的真实链路是：
+  #         nginx :3082(ssl)  ->  127.0.0.1:3090（dsh-multi-user 网关）
+  #                                       ->  127.0.0.1:3080（宿主 dsh-web 实例）
+  #     sites-enabled/dsh-web 的 `location /` 原文就是 proxy_pass 127.0.0.1:3090。
+  #     早先那版 fallback 写了 3080，一旦触发就等于**把多用户网关整个摘掉**：
+  #     能登录、能对话，但所有账号都变成宿主 admin 一个人 ——
+  #     数据隔离、账号级 profile、RAG 分端口全部失效，而且**不会有任何报错**。
+  #     这类"看起来能用"的降级比直接起不来危险得多。
+  local P_UP=3090
+  ss -lnt 2>/dev/null | grep -q ":3090 " || {
+    # 网关没在听（底座刚装、还没起实例）时退回 3080，但要明确告警
+    P_UP=3080
+    warn "  3090（多用户网关）未监听，暂时降级到 3080（宿主实例，无多账号隔离）"
+  }
+  local p3082=3082
+
+  # ── 三级降级 ────────────────────────────────────────────────────────
+  # L1  原配置可用            -> 不动（已在函数开头返回）
+  # L2  只修"源机专属"部分    -> 重写 listen / server_name，保留全部 location
+  # L3  L2 仍不通过           -> 换成最小可用反代（丢掉业务 location，保证能进）
+  warn "  dsh-proxy 配置含源机专属内容，按三级降级修复（上游 :${P_UP}）"
+  local ts; ts=$(date +%Y%m%d%H%M%S)
+  $SUDO cp -a "$conf" "${conf}.orig-${ts}" 2>/dev/null || true
+
+  # ---------- L2：把 sites-enabled/dsh-web 里写死的源机地址换成本机 ----------
+  local site=/etc/nginx/sites-enabled/dsh-web
+  if [ -f "$site" ]; then
+    $SUDO cp -a "$site" "${site}.orig-${ts}" 2>/dev/null || true
+    # listen 10.18.105.4:3080; / listen 100.100.8.6:3080;  这类带具体网卡的
+    # 监听全部删掉 —— 目标机没有这些地址，nginx 直接 bind 失败。
+    # 保留 0.0.0.0:3082 ssl 那一行（它才是对外入口）。
+    $SUDO sed -i -E \
+      -e '/^[[:space:]]*listen[[:space:]]+[0-9]{1,3}(\.[0-9]{1,3}){3}:[0-9]+[[:space:]]*;/d' \
+      "$site" 2>/dev/null || true
+    # 保险：若一个 listen 都不剩，补一个纯 3082
+    if ! $SUDO grep -qE '^[[:space:]]*listen[[:space:]]+[0-9]' "$site" 2>/dev/null; then
+      $SUDO sed -i -E "0,/^[[:space:]]*server[[:space:]]*\{/s//server {\n    listen ${p3082} ssl;/" "$site" 2>/dev/null || true
+    fi
+    # 证书缺失则现场自签（源机证书随包内联，缺件说明包不完整）
+    if [ ! -f /etc/ssl/dsh/server.crt ] || [ ! -f /etc/ssl/dsh/server.key ]; then
+      $SUDO mkdir -p /etc/ssl/dsh
+      if command -v openssl >/dev/null 2>&1; then
+        $SUDO openssl req -x509 -newkey rsa:2048 -nodes -days 1095 \
+          -keyout /etc/ssl/dsh/server.key -out /etc/ssl/dsh/server.crt \
+          -subj "/C=CN/O=DeepSeek-Harness/CN=dsh.local" >/dev/null 2>&1 \
+          && ok "  证书缺失，已现场自签 /etc/ssl/dsh/server.{crt,key}" \
+          || warn "  自签证书失败，3082(ssl) 可能起不来"
+      fi
+    fi
+    if $SUDO /usr/sbin/nginx -c "$conf" -t >/dev/null 2>&1; then
+      ok "  L2 修复成功：保留业务 location，仅重写 listen/证书"
+      $SUDO systemctl restart dsh-proxy >/dev/null 2>&1 || true
+      sleep 2
+      [ "$(systemctl is-active dsh-proxy 2>/dev/null)" = "active" ] \
+        && ok "  dsh-proxy: L2 修复后已启动（:${p3082} -> 127.0.0.1:${P_UP}）" \
+        && return 0
+      warn "  L2 配置校验通过但服务未起来，继续降到 L3"
+    else
+      warn "  L2 仍不通过（可能 include 缺件或语法不兼容），降到 L3 最小反代"
+      $SUDO cp -a "${site}.orig-${ts}" "$site" 2>/dev/null || true
+    fi
+  fi
+
+  # ---------- L3：最小可用反代（只保证能进 DSH，业务子路径先不管）----------
+  {
+    echo "pid /run/dsh-proxy.pid;"
+    echo "events { worker_connections 1024; }"
+    echo "http {"
+    echo "    map \$http_upgrade \$connection_upgrade {"
+    echo "        default upgrade;"
+    echo "        ''      close;"
+    echo "    }"
+    echo "    server {"
+    echo "        listen ${p3082} ssl;"
+    echo "        ssl_certificate     /etc/ssl/dsh/server.crt;"
+    echo "        ssl_certificate_key /etc/ssl/dsh/server.key;"
+    echo "        ssl_protocols TLSv1.2 TLSv1.3;"
+    echo "        server_name _;"
+    echo "        client_max_body_size 512m;"
+    echo "        proxy_buffering off;"
+    echo "        proxy_request_buffering off;"
+    echo "        location / {"
+    echo "            proxy_pass http://127.0.0.1:${P_UP};"
+    echo "            proxy_http_version 1.1;"
+    echo "            proxy_set_header Host              \$http_host;"
+    echo "            proxy_set_header X-Real-IP         \$remote_addr;"
+    echo "            proxy_set_header X-Forwarded-For   \$remote_addr;"
+    echo "            proxy_set_header X-Forwarded-Proto \$scheme;"
+    echo "            proxy_set_header Upgrade           \$http_upgrade;"
+    echo '            proxy_set_header Connection        $connection_upgrade;'
+    echo "            proxy_read_timeout 3600s;"
+    echo "            proxy_send_timeout 3600s;"
+    echo "        }"
+    echo "    }"
+    echo "}"
+  } > /tmp/_dsh_ngx.$$ 2>/dev/null
+
+  $SUDO cp /tmp/_dsh_ngx.$$ "$conf"
+  rm -f /tmp/_dsh_ngx.$$
+  if $SUDO /usr/sbin/nginx -c "$conf" -t >/dev/null 2>&1; then
+    warn "  已写入 L3 最小反代（:${p3082} -> 127.0.0.1:${P_UP}）"
+    warn "  ⚠️ 业务子路径（/xw、/meeting-word-editor、/_dshsync、智汇）未包含，"
+    warn "     原配置已备份为 ${conf}.orig-${ts}，需要时请人工合回"
+    $SUDO systemctl restart dsh-proxy >/dev/null 2>&1 || true
+    sleep 2
+    [ "$(systemctl is-active dsh-proxy 2>/dev/null)" = "active" ] \
+      && ok "  dsh-proxy: L3 修复后已启动" \
+      || err "  dsh-proxy: L3 仍未起来，见 journalctl -u dsh-proxy -n 30"
+  else
+    err "  三级降级全部失败。dsh-proxy 保持停用；DSH 本体可通过 :${P_UP} 直连"
+    err "  诊断：/usr/sbin/nginx -c $conf -t"
   fi
 }
 

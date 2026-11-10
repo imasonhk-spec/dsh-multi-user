@@ -1,8 +1,8 @@
 {
   "name": "dsh-multi-user",
   "unit": "dsh-multi-user",
-  "version": "1.2.0",
-  "previousVersion": "1.1.2",
+  "version": "1.2.1",
+  "previousVersion": "1.2.0",
   "title": "多用户网关插件",
   "kind": "plugin",
   "services": [],
@@ -11,7 +11,7 @@
   "hasVenv": false,
   "hasNode": false,
   "hasHarness": false,
-  "generatedAt": "2026-11-02T07:53:38+08:00",
+  "generatedAt": "2026-11-10T10:26:50+08:00",
   "host": "lgsj",
   "installScope": [
     "host-profile",
